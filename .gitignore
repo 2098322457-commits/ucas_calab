@@ -1,0 +1,19 @@
+# ---- 仿真/综合产物（大文件，必须忽略）----
+*.vcd
+*.wdb
+*.wlf
+*.bit
+*.dcp
+*.ltx
+*.rpt
+*.jou
+*.log
+run_vivado/
+*.sim/
+xsim/
+
+# ---- 二进制 / 安装包 / 压缩包 ----
+*.exe
+*.dll
+*.msi
+*.zip
