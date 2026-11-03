@@ -543,6 +543,7 @@ assign load_conflict =
                         mem_wb_dest != 5'd0 &&
                         ((use_rj  && (rj       == mem_wb_dest)) ||
                          (use_rkd && (rf_raddr2 == mem_wb_dest))));
+//增加wb阶段的阻塞。原先wb的前递是在访存固定一拍的情况下，现在访存时间开销未知故必须要阻塞
 
 // 产生暂停信号（冻结 IF/ID）：EX 除法忙、load-use 冲突，
 // 或 EX 中为多周期 div/mod（alu_op[18:15]）时暂停
@@ -626,7 +627,7 @@ always @(posedge clk)begin
     end
     else begin
         // 核内定时器：En=1 且未停止时逐拍递减，减到 0 置 TI(IS[11]) 
-        if(csr_tcfg[0] && !timer_stop)begin
+        if(csr_tcfg[0] && !timer_stop & !hold)begin     //若无!hold，指令阻塞时计时器依旧一直-1。在随机种子下可能导致中断落点错误
             if(csr_tval == 32'b0)begin
                 csr_estat[11] <= 1'b1;                   // 定时器中断置位（TI 对应 IS[11]）
                 csr_tval      <= csr_tcfg[1] ? csr_tcfg[31:2] : 32'b0; // 周期模式重装初值

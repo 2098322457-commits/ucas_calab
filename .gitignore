@@ -8,7 +8,8 @@
 *.rpt
 *.jou
 *.log
-run_vivado/
+# Vivado 工程目录：仅忽略生成物，保留 create_project.tcl / constraints / *.xpr
+**/run_vivado/project/*/
 *.sim/
 xsim/
 
