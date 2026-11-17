@@ -1,0 +1,398 @@
+===== PAGE 1 =====
+异常与中断设计专题
+体系结构研讨课 exp12 13实验报告
+Exp12
+一、实验要求
+在前几个实验中，我们已经完成了基本的五级流水线 CPU 设计，包括数据冒险时的阻塞、前
+递处理，以及算术逻辑、乘除、分支和按宽度访存各类指令。而在本次实验中，需要在 exp11
+的基线上加入 CSR 寄存器访问、系统调用与异常返回：三条 CSR 指令 csrrd、csrwr、
+csrxchg，系统调用指令 syscall，异常返回指令 ertn，以及 CRMD、PRMD、ESTAT、ERA、
+EENTRY、SAVE0~SAVE3 等 CSR 寄存器。
+实验要求能够从用户态通过 syscall 进入核心态，在异常入口完成现场保存、状态检查和必
+要的 ERA 调整，再通过 ertn 回到用户态继续执行；同时要通过 exp12 的功能仿真和上板验
+证。按测试框架配置，exp12 的功能点范围是 n1~n47，其中 n1~n46 是前几个实验的回归，
+n47 是 syscall 专项测试，最终要求 47/47 通过。
+本实验的改动集中在 myCPU/ID.v，IF、EX、MEM、WB 四级基本沿用 exp11 的结构。因此下面
+的结构框图重点标出 ID 级新增的 CSR 寄存器堆和异常/系统调用控制，以及它们与 IF 重定
+向、WB 写回之间的关系。
+二、小组分工
+本次实验的核心部分由汪涵哲独立完成，包括 CSR 指令译码、CSR 寄存器与读写通路、
+syscall/ertn 的异常跳转、功能仿真、上板调试。
+三、exp12 思路与设计
+这一节按照“CSR 指令与寄存器 → syscall/ertn → 流水线控制”的顺序展开。CSR 指令解
+决“怎么读写特殊寄存器”，syscall/ertn 解决“怎么进入和离开异常处理程序”，流水线
+控制则保证这两件事不会和已有的分支、除法停顿打架。
+3.1 CSR 指令与 CSR 寄存器
+指令语义：csrrd rd, csr_num 把 CSR[csr_num] 的当前值读入 rd；csrwr rd, csr_num 把
+rd 的值写入 CSR[csr_num]，同时把 CSR 的旧值写回 rd；csrxchg rd, rj, csr_num 以 rj
+为按位掩码，把 rd 的对应位写入 CSR，并把 CSR 的整个旧值写回 rd。
+设计思路：CSR 指令的编码比较规整：inst[31:24] 固定为 0x04，inst[23:10] 是 CSR 号，
+inst[9:5] 区分具体操作，不需要再占用 op_31_26 的独热译码空间。识别代码如下：
+代码片段 1 CSR 指令译码
+wire [13:0] csr_num = inst[23:10];
+===== PAGE 2 =====
+wire inst_csr = (inst[31:24] == 8'h04);
+wire inst_csrrd = inst_csr & (inst[9:5] == 5'h00);
+wire inst_csrwr = inst_csr & (inst[9:5] == 5'h01);
+wire inst_csrxchg = inst_csr & (inst[9:5] != 5'h00)
+& (inst[9:5] != 5'h01);
+CSR 号与寄存器的对应按实验要求实现：0x0 为 CRMD，0x1 为 PRMD，0x5 为 ESTAT，0x6 为
+ERA，0xC 为 EENTRY，0x30~0x33 为 SAVE0~SAVE3。复位时 CRMD 置为 0x00000008，即
+DA=1，表示直接地址模式；其余 CSR 清零。CRMD 的 [1:0] 是当前特权级 PLV（0 为核心
+态，3 为用户态），[2] 是全局中断使能 IE，[3] 是直接地址模式 DA。PRMD 的布局与 CRMD
+低位一致，用来保存进入异常前的状态。
+读通路由一个组合 case 选择 csr_rdata；写通路先把写掩码和写数据组合成 csr_wvalue，
+再在时钟沿按 csr_num 写入。核心代码如下：
+代码片段 2 CSR 读写通路
+always @(*) begin
+case (csr_num)
+14'h00 : csr_rdata = csr_crmd;
+14'h01 : csr_rdata = csr_prmd;
+14'h05 : csr_rdata = csr_estat;
+14'h06 : csr_rdata = csr_era;
+14'h0c : csr_rdata = csr_eentry;
+14'h30 : csr_rdata = csr_save0;
+// ... SAVE1~SAVE3 同理，default 读 0
+endcase
+end
+assign csr_wmask = inst_csrwr ? 32'hffffffff : rj_value_fwd;
+assign csr_wdata = rkd_value_fwd;
+assign csr_wvalue = (csr_rdata & ~csr_wmask)
+| (csr_wdata & csr_wmask);
+assign csr_we = (inst_csrwr | inst_csrxchg)
+& if_id_valid & ~stall;
+===== PAGE 3 =====
+csrwr 的写掩码是全 1，等价于整字写入；csrxchg 的掩码来自 rj，按位选择要写的位。这
+里有一个容易漏的点：csrwr 和 csrxchg 的第二源操作数在 rd 字段，需要把它们加入
+src_reg_is_rd 和 use_rkd，csrxchg 的 rj 还要加入 use_rj，否则 load-use 冲突判断会
+漏掉这两条指令，紧邻 load 之后使用就会出错。
+写回方面，三条 CSR 指令都走“0 + csr_rdata”的 ALU 通路，结果就是 CSR 的旧值。这样
+csrrd 可以把 CSR 读入 rd，csrwr、csrxchg 也能把旧值写回 rd。具体做法是把 id_src1
+置 0、id_src2 选 csr_rdata，并把三条指令加入 alu_op[0]。
+CSR 写入和异常提交可能在同一拍发生，优先级定为：异常 > ertn > CSR 写。这样 syscall
+进入异常时，CRMD、PRMD、ERA、ESTAT 的硬件更新不会被同一条指令的 CSR 写覆盖。
+3.2 syscall 与 ertn
+syscall 的机器码高 17 位是 0x00056，ertn 的机器码固定为 0x06483800，直接按位匹配即
+可。识别和提交条件如下：
+代码片段 3 syscall / ertn 的识别与提交
+assign inst_syscall = (inst[31:15] == 17'h00056);
+assign inst_ertn = (inst == 32'h06483800);
+assign exception_taken = if_id_valid && !stall && inst_syscall;
+assign ertn_taken = if_id_valid && !stall && inst_ertn;
+syscall 提交时，硬件做五件事：ERA ← 当前 syscall 指令的 PC；PRMD[2:0] ←
+CRMD[2:0]；CRMD[2:0] ← 0，即进入核心态并关闭全局中断；ESTAT.Ecode ← 0xB、
+ESubCode ← 0；PC ← EENTRY。ertn 则把 CRMD[2:0] 恢复为 PRMD[2:0]，并让 PC ←
+ERA。
+代码片段 4 syscall / ertn 的现场保存与恢复
+if (exception_taken) begin
+csr_era <= if_id_pc;
+csr_prmd[2:0] <= csr_crmd[2:0];
+csr_crmd[2:0] <= 3'b000;
+csr_estat[21:16] <= 6'h0b;
+csr_estat[30:22] <= 9'h0;
+end
+else if (ertn_taken) begin
+csr_crmd[2:0] <= csr_prmd[2:0];
+end
+===== PAGE 4 =====
+跳转复用了已有的 br_taken/br_target 通路：br_taken 或上 exception_taken、
+ertn_taken；br_target 按优先级选 EENTRY、ERA 或原来的分支目标。IF 在 br_taken 时清
+掉 if_id_valid 并从 br_target 重新取指，所以 syscall/ertn 后面的顺序指令会被冲刷
+掉。syscall 和 ertn 本身不写通用寄存器，gr_we 中要把它们排除。
+异常提交同样加了 !stall。如果前一条除法还没算完，stall 会拉住流水线，此时不能把
+syscall 送进异常入口，否则 ERA 和现场会乱。这一点在 n47 里专门用 syscall 与
+div.w、mul.w 相邻的场景测过。
+软件侧在 EENTRY 指向的 handler 中依次检查 ERA、ESTAT.Ecode、CRMD、PRMD：ERA 应等于
+syscall 的 PC，Ecode 应为 0xB，CRMD 应为 0（核心态），PRMD 应保存进入前的用户态/中
+断状态。检查通过后，对于 syscall 这种“返回到下一条指令”的异常，handler 把 ERA 加
+4，再执行 ertn；否则回来时会再次执行同一条 syscall。
+代码片段 5 测试程序中 syscall handler 的检查与返回（节选）
+csrrd r12, csr_era
+bne r27, r12, ex_finish
+csrrd r12, csr_estat
+srli.w r12, r12, 16
+andi r12, r12, 0x3f
+li.w r13, 0xb
+bne r12, r13, ex_finish
+csrrd r12, csr_crmd
+andi r12, r12, 0x7
+bne r0, r12, ex_finish
+// ... 检查通过后：
+csrrd r13, csr_era
+addi.w r13, r13, 4
+csrwr r13, csr_era
+ertn
+n47 还覆盖了从用户态进入核心态、在核心态再次 syscall、syscall 前后 CSR 写、以及用
+csrwr 修改 ERA 等场景，用来验证异常提交不会被多周期除法或前递干扰。完整的软硬件流
+程如下图所示。
+3.3 流水线控制与实现细节
+===== PAGE 5 =====
+CSR 指令在 ID 级完成读和写，写回仍走 WB，所以从 CSR 读出的旧值到 rd 之间存在普通的
+RAW 关系，前递逻辑不用特殊处理。
+syscall/ertn 的 br_taken 是组合信号，和普通分支一样只冲刷 IF-ID 这一拍。exp12 没有
+单独清 ID-EX，原因是 syscall/ertn 的 gr_we 为 0，进入 EX 也不会写回，相当于一个不
+写回的气泡。这个做法在 exp12 能通过测试，但不够干净；exp13 后来用 id_redirect 显式
+把 ID-EX 清成气泡，这是两个版本之间的一个明显改进。
+另外，csr_we 直接用 if_id_valid && !stall，而异常提交的优先级更高。如果同一拍既有
+CSR 写又有 syscall，硬件异常状态优先；如果 stall 有效，CSR 写也不应该发生，否则会
+重复写入。
+四、仿真与上板验证
+exp12 的测试程序在 test_config.h 中选择 n1~n47，TEST1~TEST4 打开，TEST5~TEST9 关
+闭。n1~n46 是 exp10/11 的回归，n47 是 syscall 专项。在 soc_verify/soc_bram 的
+testbench 中跑完测试后，按测试框架约定 0xbfaff030 写测试号、0xbfaff040 写 pass 标
+志。exp12 的 golden_trace.txt 末尾写回 0x2f（47）和 1，说明 47 个功能点全部通过。
+上板后同样通过 confreg 观察测试号与 pass 标志，结果与仿真一致。
+五、debug 说明
+exp12 的坑主要集中在“异常是一条指令之外的事情”这一点上。下面几条是我们调试时最容
+易踩的：
+• ertn 后又执行了一遍 syscall。ERA 保存的是 syscall 本身的 PC，不是 PC+4。handler
+检查通过后要先给 ERA 加 4，再 ertn；否则会回到同一条 syscall，表现为反复进异常。
+• csrwr 写回的值不对。csrwr 的写数据是 rd 的旧值，写回 rd 的是 CSR 的旧值。这两个
+“旧值”都必须在时钟沿之前取好，不能先更新 CSR 再读 csr_rdata，否则写回值会变成新
+值。
+• csrxchg 的掩码读错寄存器。csrxchg 的掩码在 rj，写入值在 rd。只把 csrxchg 加进
+src_reg_is_rd 而忘了 use_rj，或者反过来，仿真时会出现“掩码位不对/写入了整个字”的
+现象。
+• syscall 和除法相邻时现场错乱。异常提交必须带 !stall。除法忙的时候流水线是冻结
+的，此时提交 syscall 会把 ERA 记成错误的 PC，还会让后面的 CSR 写和异常更新抢同一
+拍。
+• ertn 恢复 CRMD 时把 DA 位弄丢。只恢复 PRMD[2:0] 到 CRMD[2:0]，不要把整个 PRMD 写
+回 CRMD。DA 位是复位时设置的直接地址模式，一旦被清掉，后续取指/访存都会出问题。
+• CSR 写和异常同拍。优先级要明确成“异常 > ertn > CSR 写”，否则 syscall 进入异常
+时，同一条指令的 CSR 写可能把 CRMD/ESTAT 又改回去。
+六、结论
+exp12 让我们第一次把“指令”之外的体系结构概念落到 RTL：CSR 不是普通寄存器，它有地
+址空间、读写语义和特权级；异常也不是一条简单的跳转，而是“硬件保存现场 + 软件处理
+===== PAGE 6 =====
++ ertn 恢复”的一套契约。实现过程中，CSR 读写本身并不难，难的是把异常提交放到正确
+的流水级，并和已有的 stall、前递、分支重定向协调好。从结果看，exp12 的 47/47 功能
+点全部通过，上板也能正确显示测试号和 pass 标志；这一版搭起的 syscall/ertn 通路，为
+exp13 继续加入 break、ADEF、ALE、INE、中断和定时器提供了一个可以复用的骨架。
+修改记录说明（文字版）
+v1.0（2026-10-23，汪涵哲，myCPU/ID.v）：增加 CSR 指令（csrrd/csrwr/csrxchg）、CSR
+寄存器（CRMD/PRMD/ESTAT/ERA/EENTRY/SAVE0~3）、syscall/ertn 与异常重定向。
+v1.1（2026-10-24，汪涵哲，func/include/test_config.h、func/obj/test.s、
+gettrace/golden_trace.txt）：切换到 exp12 的 n1~n47 配置，重新生成测试程序与
+golden trace。
+===== PAGE 7 =====
+exp13
+一、实验要求
+exp12 已经搭好了 CSR 寄存器、syscall 和 ertn 的骨架，但当时只处理了系统调用这一种
+异常。本次 exp13 要把异常/中断通道补全：同步异常包括取指地址错 ADEF、地址非对齐
+ALE、断点 BRK、指令不存在 INE 和系统调用 SYS；中断包括定时器中断 TI 和软件中断；同
+时新增 ECFG、BADV、TID、TCFG、TVAL、TICLR 等 CSR，以及 break、rdcntvl.w、
+rdcntvh.w、rdcntid 等指令。
+实验要求所有异常/中断都在 ID 级统一判定并按优先级提交，硬件负责保存 ERA、PRMD、
+CRMD、ESTAT，ADEF/ALE 还要更新 BADV；软件 handler 读取这些 CSR 完成检查、清中断
+源，最后通过 ertn 返回。按测试框架配置，exp13 的功能点范围是 n1~n58，其中 n1~n46
+是回归，n47~n58 是异常/中断/计数器专项，最终要求 58/58 通过。
+本实验的改动仍然集中在 myCPU/ID.v，但因为异常源变多、定时器又要持续计数，ID 级实际
+上变成了“译码 + 异常判定 + CSR 提交 + 定时器”四个部分的组合
+二、小组分工
+exp13 由周翔完成：包括异常/中断判定、定时器与自由计数器、CSR 扩展、功能仿真、上板
+调试。
+三、exp13 思路与设计
+exp13 的设计可以概括成三句话：同步异常在 ID 级按优先级编码，中断用“全局开关 & 局
+部使能 & 状态位”三级与判断，所有异常/中断最后都走同一条现场保存和 EENTRY 重定向通
+路。下面分块说明。
+3.1 异常与中断来源
+exp13 需要处理的异常/中断类型、触发条件与异常码如下：ADEF（0x8）为取指 PC 不是 4
+字节对齐，更新 ERA、BADV；ALE（0x9）为字访问 addr[1:0] != 0、半字访问 addr[0] !=
+0，更新 ERA、BADV；SYS（0xB）为 syscall；BRK（0xC）为 break 0；INE（0xD）为译码未
+命中任何已实现指令；INT（0x0）为 CRMD.IE & (ESTAT.IS & ECFG.LIE) 非零，具体中断源
+看 ESTAT.IS。
+ADEF 在 ID 级直接用 if_id_pc[1:0] 判断；ALE 用与 EX 一致的地址公式 mem_addr =
+rj_value_fwd + imm 预算。字节访问不检查对齐，半字检查 addr[0]，字检查 addr[1:0]。
+这里用 rj_value_fwd 而不是 rj_value，是为了让紧邻 load 的地址也能通过前递得到正确
+值。
+INE 用一个 inst_known 的大 OR 把所有已实现的指令列进去，任何一条都不命中就认为指令
+不存在。这个写法比逐条判断非法 opcode 稳，新增指令时只要记得往 inst_known 里补。
+tlbwr 在本实验里没有 TLB，但为了不让后续 TLB 测试提前掉进 INE，也把它当作已知指令
+列进去（不产生效果）。
+===== PAGE 8 =====
+代码片段 1 同步异常的判定
+assign mem_addr = rj_value_fwd + imm;
+assign mem_is_word = inst_ld_w | inst_st_w;
+assign mem_is_half = inst_ld_h | inst_ld_hu | inst_st_h;
+assign adef_valid = if_id_valid && !stall && (if_id_pc[1:0] != 2'b00);
+assign ale_valid = if_id_valid && !stall &&
+((mem_is_word && (mem_addr[1:0] != 2'b00)) ||
+(mem_is_half && (mem_addr[0] != 1'b0 )));
+assign break_valid = if_id_valid && !stall && inst_break;
+assign syscall_valid = if_id_valid && !stall && inst_syscall;
+assign ine_valid = if_id_valid && !stall && !inst_known;
+assign sync_exc_valid = adef_valid | ale_valid | syscall_valid
+| break_valid | ine_valid;
+break 0 的机器码是 0x002a0000，即 inst[31:15] == 17'h00054；syscall 是 17'h00056；
+ertn 仍然按整字 0x06483800 识别。
+3.2 异常判定与优先级
+同步异常之间不是随便选一个就行，必须按优先级编码。我们采用的顺序是 ADEF > ALE >
+SYS > BRK > INE，同步异常整体优先于中断。这个顺序直接体现在 exception_ecode 的级联
+mux 中：
+代码片段 2 异常码优先级编码
+assign exception_ecode = adef_valid ? 6'h08 :
+ale_valid ? 6'h09 :
+syscall_valid ? 6'h0b :
+break_valid ? 6'h0c :
+ine_valid ? 6'h0d : 6'h00;
+中断的挂起条件写成三级与：CRMD.IE 是全局开关，ECFG.LIE[n] 是局部使能，ESTAT.IS[n]
+是状态位，只有三者同时为 1 才响应该中断。同步异常的优先级高于中断，所以 intr_valid
+里还要与上 !sync_exc_valid；stall 时说明前一条多周期指令还没完成，也要等它完成再提
+交。
+代码片段 3 中断挂起与提交条件
+===== PAGE 9 =====
+assign intr_pending = csr_crmd[2]
+& (|(csr_estat[12:0] & csr_ecfg[12:0]));
+assign intr_valid = if_id_valid && !stall
+&& intr_pending && !sync_exc_valid;
+assign exception_valid = sync_exc_valid | intr_valid;
+中断的 Ecode 统一为 0x0，具体是哪个中断源要看 ESTAT.IS。定时器对应 IS[11]，软件中
+断对应 IS[1:0]；handler 根据 IS 的位决定写 TICLR 清除还是写 ESTAT 清除。
+3.3 中断与定时器
+定时器的核心是 TCFG、TVAL 和 TICLR 三个寄存器。TCFG[0] 是 En，[1] 是 Periodic，
+[31:2] 是 InitVal；写 TCFG 时把 InitVal 装入 TVAL，并根据 En 设置 timer_stop。每个
+时钟沿，如果 En=1 且 timer_stop=0，TVAL 减 1；减到 0 时置 ESTAT.IS[11]（TI），周期
+模式重装 InitVal，非周期模式把 TVAL 清 0 并停住。
+代码片段 4 定时器计数与 TI 置位
+if (csr_tcfg[0] && !timer_stop) begin
+if (csr_tval == 32'b0) begin
+csr_estat[11] <= 1'b1; // TI 挂起
+csr_tval <= csr_tcfg[1] ? csr_tcfg[31:2] : 32'b0;
+timer_stop <= ~csr_tcfg[1]; // 非周期到期后停止
+end
+else csr_tval <= csr_tval - 32'b1;
+end
+写 TCFG 时同时重装 TVAL，所以软件不需要先写 TVAL 再写 TCFG。TICLR 只实现“写 1 清
+TI”，读出恒为 0；软件写 0 不应该清 TI，否则读改写会误清。软件中断则通过写
+ESTAT.IS[1:0] 置位，ECFG.LIE[1:0] 使能后就能触发。
+测试里 n49 用 TEST_TI_EX/TEST_TI_EX_CYC 分别测非周期和周期定时器，n51 用
+TEST_SOFT_INT_EX 测软件中断。两者都要求 CRMD.IE、ECFG.LIE、ESTAT.IS 同时有效，并且
+handler 退出前要清掉中断源，否则 ertn 恢复 CRMD.IE 后会立刻再次进中断。
+3.4 异常提交、返回与流水线重定向
+所有异常/中断最后都走同一条提交通路。硬件做六件事：ERA ← 当前 PC；PRMD[2:0] ←
+CRMD[2:0]；CRMD[2:0] ← 0；ESTAT.Ecode ← exception_ecode；ESTAT.ESubCode ← 0；PC
+← EENTRY。ADEF/ALE 还要把出错地址写进 BADV：ADEF 写 if_id_pc，ALE 写 mem_addr。
+ertn 则恢复 CRMD[2:0] ← PRMD[2:0]，并让 PC ← ERA。
+===== PAGE 10 =====
+代码片段 5 异常 / 中断的统一提交
+if (exception_valid) begin
+csr_era <= if_id_pc;
+csr_prmd[2:0] <= csr_crmd[2:0];
+csr_crmd[2:0] <= 3'b000;
+csr_estat[21:16] <= exception_ecode;
+csr_estat[30:22] <= 9'h0;
+if (adef_valid | ale_valid)
+csr_badv <= adef_valid ? if_id_pc : mem_addr;
+end
+else if (ertn_taken) begin
+csr_crmd[2:0] <= csr_prmd[2:0];
+end
+异常/中断和普通分支共用 br_taken/br_target：br_target 的优先级是 exception_valid ?
+EENTRY : ertn_taken ? ERA : 普通分支。ID 级新增 id_redirect = exception_valid |
+ertn_taken，一旦重定向就把 ID-EX 流水寄存器清成气泡。这是相对 exp12 的一个重要修
+正：exp12 只靠 gr_we=0 让 syscall 流过去，exp13 的 break、INE 等情况更复杂，必须显
+式清 ID-EX，避免异常指令或其后指令继续进入 EX/MEM。
+代码片段 6 重定向时清 ID-EX
+assign id_redirect = exception_valid | ertn_taken;
+...
+else if (stall || id_redirect) begin
+id_ex_valid <= 1'b0;
+id_ex_pc <= 32'b0;
+id_ex_alu_op <= 19'b0;
+id_ex_gr_we <= 1'b0;
+id_ex_mem_we <= 1'b0;
+id_ex_res_from_mem <= 1'b0;
+... // 其余字段同样清空
+end
+===== PAGE 11 =====
+这里还要注意 ERA 的语义：异常提交时保存的是“当前指令”的 PC，而不是 PC+4。
+syscall、break、INE 这些指令在 handler 返回后不应该重新执行，所以软件通常把 ERA 加
+4 再 ertn；ADEF/ALE 则要看异常是否可恢复，n52 的 ADEF 测试里就通过 csrwr 修改 ERA
+后 ertn 到指定位置。返回地址怎么调整是软件和异常类型共同决定的，硬件只负责保存和恢
+复。
+3.5 计数器与 rdcnt 指令
+free_cnt 是一个 64 位自由计数器，每个时钟加 1；rdcntvl.w 读低 32 位，rdcntvh.w 读
+高 32 位，rdcntid 读 CSR.TID。三条指令的 rd 位置不一样：rdcntvl/rdcntvh 的 rd 在
+[4:0]，rdcntid 的 rd 在 [9:5]，所以 dest 要单独 mux。
+代码片段 7 rdcnt 指令译码与目的寄存器选择
+assign inst_rdcntvl = (inst[31:10] == 22'h000018)
+& (inst[9:5] == 5'b00000);
+assign inst_rdcntvh = (inst[31:10] == 22'h0019)
+& (inst[9:5] == 5'b00000);
+assign inst_rdcntid = (inst[31:10] == 22'h0018)
+& (inst[4:0] == 5'b00000)
+& (inst[9:5] != 5'b00000);
+assign dest = inst_rdcntid ? inst[9:5]
+: (dst_is_r1 ? 5'd1 : rd);
+这三条指令都走“0 + csr_rdata”的写回通路，csr_rdata 的选择先判断 rdcnt 指令，再按
+csr_num 选普通 CSR。rdcntid 的 rd 不在 [4:0]，如果直接沿用 dest = rd，结果会写到
+r0，测试里表现为 TID 读不回来。
+n58 会在两条 rdcnt 指令之间插入 div.w/mul.w 和 CSR 读写，检查计数器读数单调、TID
+可读写、以及多周期指令不会破坏读回值。free_cnt 每个时钟都加，所以两次读数的差值应
+该为正；测试里用 bltu 比较差值，正好验证了这一点。
+3.6 CSR 扩展与写保护
+exp13 在 exp12 的 CSR 基础上新增 ECFG（0x4）、BADV（0x7）、TID（0x40）、TCFG
+（0x41）、TVAL（0x42）、TICLR（0x44）。这些 CSR 不是简单的可读写寄存器，有几处写保
+护必须按手册处理：
+• ECFG：只有 LIE[12:0] 有效，bit10 是保留位，写入值按 0x1bff 屏蔽，读回 bit10 恒为
+0；
+• BADV：只由 ADEF/ALE 硬件更新，也可由软件写，其他异常不更新；
+• TID：核号，软件可读写；
+===== PAGE 12 =====
+• TCFG：[0]=En，[1]=Periodic，[31:2]=InitVal，写 TCFG 同时重装 TVAL；
+• TVAL：当前计数值，软件可直接写；
+• TICLR：只实现写 1 清 TI，读出恒为 0。
+ESTAT 的写保护也值得单独说：软件只能写 Ecode/ESubCode 和 IS[1:0]，IS[12:2] 是硬件
+中断状态，软件写入无效；TI 对应 IS[11]，只能由定时器置位、由 TICLR 清除。测试里会
+专门读回检查，比如 ECFG 的 bit10 写 1 后读回必须是 0；软件直接写 ESTAT 不能改掉
+IS[11]。
+还有一个容易忽略的点：进入异常时硬件只置 ESTAT.Ecode，不会自动清 ESTAT.IS。这不会
+导致立刻重入，因为 CRMD.IE 已经被清 0；但 handler 在 ertn 之前必须把中断源清掉，否
+则恢复 IE 后会马上再次进中断。
+四、仿真与上板验证
+exp13 的测试程序在 test_config.h 中选择 n1~n58，TEST1~TEST5 打开，TEST6~TEST9 关
+闭。n1~n46 是回归，n47~n58 覆盖 syscall、break、定时器中断（非周期/周期）、INE、软
+件中断、ADEF、五条 ALE 和 rdcnt/TID。在 soc_verify/soc_bram 的 testbench 中跑完测
+试后，按测试框架约定 0xbfaff030 写测试号、0xbfaff040 写 pass 标志。exp13 的
+golden_trace.txt 末尾写回 0x3a（58）和 1，说明 58 个功能点全部通过。上板后通过
+confreg 观察测试号与 pass 标志，结果与仿真一致。
+五、debug 说明
+exp13 的难点不在单条指令，而在“同一拍可能同时发生好几件事”。下面几条是调试过程中
+最有代表性的：
+• 异常提交后 ID-EX 没有清干净。exp12 只清 IF-ID，靠 syscall 不写回混过去；exp13 的
+break、INE 如果也这样处理，异常指令后面的指令可能继续进入 EX，甚至产生写回。加上
+id_redirect 后，异常/ertn 当拍把 ID-EX 清成气泡，问题消失。
+• ALE 用了未前递的 rj 值。mem_addr 必须用 rj_value_fwd + imm，和 EX 级地址公式保持
+一致。如果直接用 rj_value，紧邻 load 的地址会算错，表现为 ALE 漏报或误报。
+• inst_known 漏指令，正常指令被判成 INE。新增指令时一定要同步更新 inst_known；否则
+译码明明识别到了，异常通道却认为“指令不存在”。tlbwr 这种本实验不实现效果的指令也
+要先列进去。
+• BADV 被所有异常更新。只有 ADEF/ALE 应该写 BADV，如果 exception_valid 一来就写
+BADV，break/INE 也会把 BADV 改掉，n48/n50 的检查会失败。
+• 定时器写 TCFG 后停不下来。写 TCFG 时不仅要重装 TVAL，还要根据 En 更新
+timer_stop。只清 TVAL 不置 timer_stop，非周期定时器到期后还会继续计数。
+• TICLR 写 0 也把 TI 清了。TICLR 的语义是“写 1 清”，写 0 必须保持 TI。早期用
+if(csr_we) 直接清，读改写时会误清，n49 的周期模式很容易暴露。
+• 中断源没清，ertn 后立刻重入。进入异常时 CRMD.IE 被清 0，所以 handler 里不会重
+入；但 ertn 恢复 IE 后，如果 ESTAT.IS 还在，就会马上再进中断。TI 要写 TICLR，软件
+中断要写 ESTAT，二者不能混。
+===== PAGE 13 =====
+• rdcntid 的结果写到 r0。rdcntid 的 rd 在 [9:5]，不能直接用 dest = rd。这个 bug 在
+n58 里表现为 TID 读回 0，但 rdcntvl/rdcntvh 看起来正常，容易误判成计数器问题。
+六、结论
+exp13 让我们真正体会到“异常/中断是一套硬件和软件的契约”。硬件要在正确的流水级判
+定异常、按优先级编码、保存现场并重定向；软件要读懂 ESTAT、BADV、ERA，清中断源，再
+决定 ERA 要不要加 4。任何一处优先级或时序没对齐，现象都可能表现为“程序跑飞”或
+“反复进异常”，而不是一条简单的报错。从结果上看，exp13 的 58/58 功能点全部通过，
+上板也能正确显示测试号和 pass 标志。相比 exp12，这一版把异常从“只有 syscall”扩展
+到了完整的同步异常、定时器中断和软件中断，也把 CSR 写保护、定时器计数、自由计数器
+和 rdcnt 指令串了起来，为后续 TLB/MMU 和更复杂的系统实验打下了基础。
+修改记录说明（文字版）
+v1.0（2026-10-23，周翔，myCPU/ID.v）：在 exp12 基础上增加 ADEF/ALE/BRK/INE、中断、
+定时器与 CSR 扩展（ECFG/BADV/TID/TCFG/TVAL/TICLR）。
+v1.1（2026-10-24，周翔，myCPU/ID.v）：增加 rdcntvl/vh/id、TID/TCFG/TVAL/TICLR 与
+id_redirect（显式清 ID-EX）。
+v1.2（2026-10-24，周翔，func/include/test_config.h、func/obj/test.s、
+gettrace/golden_trace.txt）：切换到 exp13 的 n1~n58 配置，重新生成测试程序与
+golden trace。
+实验报告补充及最终整理人：陈海龙
